@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/go-ini/ini"
+	"github.com/aws/aws-sdk-go/internal/ini"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -140,7 +140,7 @@ func TestLoadSharedConfig(t *testing.T) {
 
 func TestLoadSharedConfigFromFile(t *testing.T) {
 	filename := testConfigFilename
-	f, err := ini.Load(filename)
+	f, err := ini.OpenFile(filename)
 	if err != nil {
 		t.Fatalf("failed to load test config file, %s, %v", filename, err)
 	}
@@ -209,6 +209,16 @@ func TestLoadSharedConfigFromFile(t *testing.T) {
 				AssumeRole: assumeRoleConfig{
 					RoleARN:       "assume_role_role_arn",
 					SourceProfile: "complete_creds",
+				},
+			},
+		},
+		{
+			Profile: "assume_role_w_mfa",
+			Expected: sharedConfig{
+				AssumeRole: assumeRoleConfig{
+					RoleARN:       "assume_role_role_arn",
+					SourceProfile: "complete_creds",
+					MFASerial:     "0123456789",
 				},
 			},
 		},

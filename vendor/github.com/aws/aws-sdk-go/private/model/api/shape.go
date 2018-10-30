@@ -10,28 +10,13 @@ import (
 	"sort"
 	"strings"
 	"text/template"
-)
 
-// A ShapeRef defines the usage of a shape within the API.
-type ShapeRef struct {
-	API              *API   `json:"-"`
-	Shape            *Shape `json:"-"`
-	Documentation    string
-	ShapeName        string `json:"shape"`
-	Location         string
-	LocationName     string
-	QueryName        string
-	Flattened        bool
-	Streaming        bool
-	XMLAttribute     bool
-	XMLNamespace     XMLInfo
-	Payload          string
-	IdempotencyToken bool `json:"idempotencyToken"`
-	Deprecated       bool `json:"deprecated"`
-}
+	"github.com/aws/aws-sdk-go/private/protocol"
+)
 
 // ErrorInfo represents the error block of a shape's structure
 type ErrorInfo struct {
+	Type           string
 	Code           string
 	HTTPStatusCode int
 }
@@ -42,15 +27,45 @@ type XMLInfo struct {
 	URI    string
 }
 
+// A ShapeRef defines the usage of a shape within the API.
+type ShapeRef struct {
+	API           *API   `json:"-"`
+	Shape         *Shape `json:"-"`
+	Documentation string
+	ShapeName     string `json:"shape"`
+	Location      string
+	LocationName  string
+	QueryName     string
+	Flattened     bool
+	Streaming     bool
+	XMLAttribute  bool
+	// Ignore, if set, will not be sent over the wire
+	Ignore           bool
+	XMLNamespace     XMLInfo
+	Payload          string
+	IdempotencyToken bool   `json:"idempotencyToken"`
+	TimestampFormat  string `json:"timestampFormat"`
+	JSONValue        bool   `json:"jsonvalue"`
+	Deprecated       bool   `json:"deprecated"`
+	DeprecatedMsg    string `json:"deprecatedMessage"`
+
+	OrigShapeName string `json:"-"`
+
+	GenerateGetter bool
+
+	IsEventPayload bool `json:"eventpayload"`
+	IsEventHeader  bool `json:"eventheader"`
+}
+
 // A Shape defines the definition of a shape type
 type Shape struct {
 	API              *API `json:"-"`
 	ShapeName        string
 	Documentation    string
 	MemberRefs       map[string]*ShapeRef `json:"members"`
-	MemberRef        ShapeRef             `json:"member"`
-	KeyRef           ShapeRef             `json:"key"`
-	ValueRef         ShapeRef             `json:"value"`
+	MemberRef        ShapeRef             `json:"member"` // List ref
+	KeyRef           ShapeRef             `json:"key"`    // map key ref
+	ValueRef         ShapeRef             `json:"value"`  // map value ref
 	Required         []string
 	Payload          string
 	Type             string
@@ -61,30 +76,51 @@ type Shape struct {
 	Streaming        bool
 	Location         string
 	LocationName     string
-	IdempotencyToken bool `json:"idempotencyToken"`
+	IdempotencyToken bool   `json:"idempotencyToken"`
+	TimestampFormat  string `json:"timestampFormat"`
 	XMLNamespace     XMLInfo
 	Min              float64 // optional Minimum length (string, list) or value (number)
 	Max              float64 // optional Maximum length (string, list) or value (number)
 
+	EventStreamsMemberName string          `json:"-"`
+	EventStreamAPI         *EventStreamAPI `json:"-"`
+	EventFor               []*EventStream  `json:"-"`
+
+	IsEventStream bool `json:"eventstream"`
+	IsEvent       bool `json:"event"`
+
 	refs       []*ShapeRef // References to this shape
 	resolvePkg string      // use this package in the goType() if present
+
+	OrigShapeName string `json:"-"`
 
 	// Defines if the shape is a placeholder and should not be used directly
 	Placeholder bool
 
-	Deprecated bool `json:"deprecated"`
+	Deprecated    bool   `json:"deprecated"`
+	DeprecatedMsg string `json:"deprecatedMessage"`
 
 	Validations ShapeValidations
 
 	// Error information that is set if the shape is an error shape.
 	IsError   bool
 	ErrorInfo ErrorInfo `json:"error"`
+
+	// Flags that the shape cannot be rename. Prevents the shape from being
+	// renamed further by the Input/Output.
+	AliasedShapeName bool
+}
+
+// ErrorCodeName will return the error shape's name formated for
+// error code const.
+func (s *Shape) ErrorCodeName() string {
+	return "ErrCode" + s.ShapeName
 }
 
 // ErrorName will return the shape's name or error code if available based
-// on the API's protocol.
+// on the API's protocol. This is the error code string returned by the service.
 func (s *Shape) ErrorName() string {
-	name := s.ShapeName
+	name := s.ErrorInfo.Type
 	switch s.API.Metadata.Protocol {
 	case "query", "ec2query", "rest-xml":
 		if len(s.ErrorInfo.Code) > 0 {
@@ -93,6 +129,23 @@ func (s *Shape) ErrorName() string {
 	}
 
 	return name
+}
+
+// PayloadRefName returns the payload member of the shape if there is one
+// modeled. If no payload is modeled, empty string will be returned.
+func (s *Shape) PayloadRefName() string {
+	if name := s.Payload; len(name) != 0 {
+		// Root shape
+		return name
+	}
+
+	for name, ref := range s.MemberRefs {
+		if ref.IsEventPayload {
+			return name
+		}
+	}
+
+	return ""
 }
 
 // GoTags returns the struct tags for a shape.
@@ -104,11 +157,18 @@ func (s *Shape) GoTags(root, required bool) string {
 // Rename changes the name of the Shape to newName. Also updates
 // the associated API's reference to use newName.
 func (s *Shape) Rename(newName string) {
+	if s.AliasedShapeName {
+		panic(fmt.Sprintf("attempted to rename %s, but flagged as aliased",
+			s.ShapeName))
+	}
+
 	for _, r := range s.refs {
+		r.OrigShapeName = r.ShapeName
 		r.ShapeName = newName
 	}
 
 	delete(s.API.Shapes, s.ShapeName)
+	s.OrigShapeName = s.ShapeName
 	s.API.Shapes[newName] = s
 	s.ShapeName = newName
 }
@@ -130,19 +190,88 @@ func (s *Shape) GoTypeWithPkgName() string {
 	return goType(s, true)
 }
 
+// GoTypeWithPkgNameElem returns the shapes type as a string with the "*"
+// removed if there was one preset.
+func (s *Shape) GoTypeWithPkgNameElem() string {
+	t := goType(s, true)
+	if strings.HasPrefix(t, "*") {
+		return t[1:]
+	}
+	return t
+}
+
+// UseIndirection returns if the shape's reference should use indirection or not.
+func (s *ShapeRef) UseIndirection() bool {
+	switch s.Shape.Type {
+	case "map", "list", "blob", "structure", "jsonvalue":
+		return false
+	}
+
+	if s.Streaming || s.Shape.Streaming {
+		return false
+	}
+
+	if s.JSONValue {
+		return false
+	}
+
+	return true
+}
+
+func (s Shape) GetTimestampFormat() string {
+	format := s.TimestampFormat
+
+	if len(format) > 0 && !protocol.IsKnownTimestampFormat(format) {
+		panic(fmt.Sprintf("Unknown timestampFormat %s, for %s",
+			format, s.ShapeName))
+	}
+
+	return format
+}
+
+func (ref ShapeRef) GetTimestampFormat() string {
+	format := ref.TimestampFormat
+
+	if len(format) == 0 {
+		format = ref.Shape.TimestampFormat
+	}
+
+	if len(format) > 0 && !protocol.IsKnownTimestampFormat(format) {
+		panic(fmt.Sprintf("Unknown timestampFormat %s, for %s",
+			format, ref.ShapeName))
+	}
+
+	return format
+}
+
+// GoStructValueType returns the Shape's Go type value instead of a pointer
+// for the type.
+func (s *Shape) GoStructValueType(name string, ref *ShapeRef) string {
+	v := s.GoStructType(name, ref)
+
+	if ref.UseIndirection() && v[0] == '*' {
+		return v[1:]
+	}
+
+	return v
+}
+
 // GoStructType returns the type of a struct field based on the API
 // model definition.
 func (s *Shape) GoStructType(name string, ref *ShapeRef) string {
 	if (ref.Streaming || ref.Shape.Streaming) && s.Payload == name {
 		rtype := "io.ReadSeeker"
-		if len(s.refs) > 1 {
-			rtype = "aws.ReaderSeekCloser"
-		} else if strings.HasSuffix(s.ShapeName, "Output") {
+		if strings.HasSuffix(s.ShapeName, "Output") {
 			rtype = "io.ReadCloser"
 		}
 
 		s.API.imports["io"] = true
 		return rtype
+	}
+
+	if ref.JSONValue {
+		s.API.imports["github.com/aws/aws-sdk-go/aws"] = true
+		return "aws.JSONValue"
 	}
 
 	for _, v := range s.Validations {
@@ -196,16 +325,18 @@ func goType(s *Shape, withPkgName bool) string {
 		}
 		return "*" + s.ShapeName
 	case "map":
-		return "map[string]" + s.ValueRef.GoType()
+		return "map[string]" + goType(s.ValueRef.Shape, withPkgName)
+	case "jsonvalue":
+		return "aws.JSONValue"
 	case "list":
-		return "[]" + s.MemberRef.GoType()
+		return "[]" + goType(s.MemberRef.Shape, withPkgName)
 	case "boolean":
 		return "*bool"
 	case "string", "character":
 		return "*string"
 	case "blob":
 		return "[]byte"
-	case "integer", "long":
+	case "byte", "short", "integer", "long":
 		return "*int64"
 	case "float", "double":
 		return "*float64"
@@ -278,12 +409,17 @@ func (ref *ShapeRef) GoTags(toplevel bool, isRequired bool) string {
 		tags = append(tags, ShapeTag{"location", ref.Location})
 	} else if ref.Shape.Location != "" {
 		tags = append(tags, ShapeTag{"location", ref.Shape.Location})
+	} else if ref.IsEventHeader {
+		tags = append(tags, ShapeTag{"location", "header"})
 	}
 
 	if ref.LocationName != "" {
 		tags = append(tags, ShapeTag{"locationName", ref.LocationName})
 	} else if ref.Shape.LocationName != "" {
 		tags = append(tags, ShapeTag{"locationName", ref.Shape.LocationName})
+	} else if len(ref.Shape.EventFor) != 0 && ref.API.Metadata.Protocol == "rest-xml" {
+		// RPC JSON events need to have location name modeled for round trip testing.
+		tags = append(tags, ShapeTag{"locationName", ref.Shape.ShapeName})
 	}
 
 	if ref.QueryName != "" {
@@ -305,23 +441,18 @@ func (ref *ShapeRef) GoTags(toplevel bool, isRequired bool) string {
 	if ref.Deprecated || ref.Shape.Deprecated {
 		tags = append(tags, ShapeTag{"deprecated", "true"})
 	}
+
 	// All shapes have a type
 	tags = append(tags, ShapeTag{"type", ref.Shape.Type})
 
 	// embed the timestamp type for easier lookups
 	if ref.Shape.Type == "timestamp" {
-		t := ShapeTag{Key: "timestampFormat"}
-		if ref.Location == "header" {
-			t.Val = "rfc822"
-		} else {
-			switch ref.API.Metadata.Protocol {
-			case "json", "rest-json":
-				t.Val = "unix"
-			case "rest-xml", "ec2", "query":
-				t.Val = "iso8601"
-			}
+		if format := ref.GetTimestampFormat(); len(format) > 0 {
+			tags = append(tags, ShapeTag{
+				Key: "timestampFormat",
+				Val: format,
+			})
 		}
-		tags = append(tags, t)
 	}
 
 	if ref.Shape.Flattened || ref.Flattened {
@@ -338,23 +469,29 @@ func (ref *ShapeRef) GoTags(toplevel bool, isRequired bool) string {
 	}
 
 	if toplevel {
-		if ref.Shape.Payload != "" {
-			tags = append(tags, ShapeTag{"payload", ref.Shape.Payload})
+		if name := ref.Shape.PayloadRefName(); len(name) > 0 {
+			tags = append(tags, ShapeTag{"payload", name})
 		}
-		if ref.XMLNamespace.Prefix != "" {
-			tags = append(tags, ShapeTag{"xmlPrefix", ref.XMLNamespace.Prefix})
-		} else if ref.Shape.XMLNamespace.Prefix != "" {
-			tags = append(tags, ShapeTag{"xmlPrefix", ref.Shape.XMLNamespace.Prefix})
-		}
-		if ref.XMLNamespace.URI != "" {
-			tags = append(tags, ShapeTag{"xmlURI", ref.XMLNamespace.URI})
-		} else if ref.Shape.XMLNamespace.URI != "" {
-			tags = append(tags, ShapeTag{"xmlURI", ref.Shape.XMLNamespace.URI})
-		}
+	}
+
+	if ref.XMLNamespace.Prefix != "" {
+		tags = append(tags, ShapeTag{"xmlPrefix", ref.XMLNamespace.Prefix})
+	} else if ref.Shape.XMLNamespace.Prefix != "" {
+		tags = append(tags, ShapeTag{"xmlPrefix", ref.Shape.XMLNamespace.Prefix})
+	}
+
+	if ref.XMLNamespace.URI != "" {
+		tags = append(tags, ShapeTag{"xmlURI", ref.XMLNamespace.URI})
+	} else if ref.Shape.XMLNamespace.URI != "" {
+		tags = append(tags, ShapeTag{"xmlURI", ref.Shape.XMLNamespace.URI})
 	}
 
 	if ref.IdempotencyToken || ref.Shape.IdempotencyToken {
 		tags = append(tags, ShapeTag{"idempotencyToken", "true"})
+	}
+
+	if ref.Ignore {
+		tags = append(tags, ShapeTag{"ignore", "true"})
 	}
 
 	return fmt.Sprintf("`%s`", tags)
@@ -445,20 +582,68 @@ func (s *Shape) NestedShape() *Shape {
 	return nestedShape
 }
 
-var structShapeTmpl = template.Must(template.New("StructShape").Parse(`
+var structShapeTmpl = func() *template.Template {
+	shapeTmpl := template.Must(
+		template.New("structShapeTmpl").
+			Funcs(template.FuncMap{
+				"GetCrosslinkURL":  GetCrosslinkURL,
+				"GetDeprecatedMsg": getDeprecatedMessage,
+			}).
+			Parse(structShapeTmplDef),
+	)
+
+	template.Must(
+		shapeTmpl.AddParseTree(
+			"eventStreamAPILoopMethodTmpl", eventStreamAPILoopMethodTmpl.Tree),
+	)
+
+	template.Must(
+		shapeTmpl.AddParseTree(
+			"eventStreamEventShapeTmpl", eventStreamEventShapeTmpl.Tree),
+	)
+	template.Must(
+		shapeTmpl.AddParseTree(
+			"eventStreamExceptionEventShapeTmpl",
+			eventStreamExceptionEventShapeTmpl.Tree),
+	)
+	shapeTmpl.Funcs(eventStreamEventShapeTmplFuncs)
+
+	return shapeTmpl
+}()
+
+const structShapeTmplDef = `
 {{ .Docstring }}
+{{ if .Deprecated -}}
+{{ if .Docstring -}}
+//
+{{ end -}}
+// Deprecated: {{ GetDeprecatedMsg .DeprecatedMsg .ShapeName }}
+{{ end -}}
+{{ $context := . -}}
 type {{ .ShapeName }} struct {
 	_ struct{} {{ .GoTags true false }}
 
-	{{ $context := . -}}
 	{{ range $_, $name := $context.MemberNames -}}
 		{{ $elem := index $context.MemberRefs $name -}}
+		{{ $isBlob := $context.WillRefBeBase64Encoded $name -}}
 		{{ $isRequired := $context.IsRequired $name -}}
 		{{ $doc := $elem.Docstring -}}
 
-		{{ $doc }}
-		{{ if $isRequired -}}
+		{{ if $doc -}}
+			{{ $doc }}
+			{{ if $elem.Deprecated -}}
+			//
+			// Deprecated: {{ GetDeprecatedMsg $elem.DeprecatedMsg $name }}
+			{{ end -}}
+		{{ end -}}
+		{{ if $isBlob -}}
 			{{ if $doc -}}
+				//
+			{{ end -}}
+			// {{ $name }} is automatically base64 encoded/decoded by the SDK.
+		{{ end -}}
+		{{ if $isRequired -}}
+			{{ if or $doc $isBlob -}}
 				//
 			{{ end -}}
 			// {{ $name }} is a required field
@@ -470,12 +655,54 @@ type {{ .ShapeName }} struct {
 {{ if not .API.NoStringerMethods }}
 	{{ .GoCodeStringers }}
 {{ end }}
-{{ if not .API.NoValidataShapeMethods }}
+{{ if not (or .API.NoValidataShapeMethods .Exception) }}
 	{{ if .Validations -}}
 		{{ .Validations.GoCode . }}
 	{{ end }}
 {{ end }}
-`))
+
+{{ if not (or .API.NoGenStructFieldAccessors .Exception) }}
+	{{ $builderShapeName := print .ShapeName -}}
+	{{ range $_, $name := $context.MemberNames -}}
+		{{ $elem := index $context.MemberRefs $name -}}
+
+		// Set{{ $name }} sets the {{ $name }} field's value.
+		func (s *{{ $builderShapeName }}) Set{{ $name }}(v {{ $context.GoStructValueType $name $elem }}) *{{ $builderShapeName }} {
+			{{ if $elem.UseIndirection -}}
+				s.{{ $name }} = &v
+			{{ else -}}
+				s.{{ $name }} = v
+			{{ end -}}
+			return s
+		}
+
+		{{ if $elem.GenerateGetter -}}
+			func (s *{{ $builderShapeName }}) get{{ $name }}() (v {{ $context.GoStructValueType $name $elem }}) {
+				{{ if $elem.UseIndirection -}}
+					if s.{{ $name }} == nil {
+						return v
+					}
+					return *s.{{ $name }}
+				{{ else -}}
+					return s.{{ $name }}
+				{{ end -}}
+			}
+		{{- end }}
+	{{ end }}
+{{ end }}
+
+{{ if $.EventStreamsMemberName }}
+	{{ template "eventStreamAPILoopMethodTmpl" $ }}
+{{ end }}
+
+{{ if $.EventFor }}
+	{{ template "eventStreamEventShapeTmpl" $ }}
+
+	{{- if $.Exception }}
+		{{ template "eventStreamExceptionEventShapeTmpl" $ }}
+	{{ end -}}
+{{ end }}
+`
 
 var enumShapeTmpl = template.Must(template.New("EnumShape").Parse(`
 {{ .Docstring }}
@@ -492,22 +719,38 @@ const (
 
 // GoCode returns the rendered Go code for the Shape.
 func (s *Shape) GoCode() string {
-	b := &bytes.Buffer{}
+	w := &bytes.Buffer{}
 
 	switch {
+	case s.EventStreamAPI != nil:
+		if err := renderEventStreamAPIShape(w, s); err != nil {
+			panic(
+				fmt.Sprintf(
+					"failed to generate eventstream API shape, %s, %v",
+					s.ShapeName, err),
+			)
+		}
 	case s.Type == "structure":
-		if err := structShapeTmpl.Execute(b, s); err != nil {
-			panic(fmt.Sprintf("Failed to generate struct shape %s, %v\n", s.ShapeName, err))
+		if err := structShapeTmpl.Execute(w, s); err != nil {
+			panic(
+				fmt.Sprintf(
+					"Failed to generate struct shape %s, %v",
+					s.ShapeName, err),
+			)
 		}
 	case s.IsEnum():
-		if err := enumShapeTmpl.Execute(b, s); err != nil {
-			panic(fmt.Sprintf("Failed to generate enum shape %s, %v\n", s.ShapeName, err))
+		if err := enumShapeTmpl.Execute(w, s); err != nil {
+			panic(
+				fmt.Sprintf(
+					"Failed to generate enum shape %s, %v",
+					s.ShapeName, err),
+			)
 		}
 	default:
 		panic(fmt.Sprintln("Cannot generate toplevel shape for", s.Type))
 	}
 
-	return b.String()
+	return w.String()
 }
 
 // IsEnum returns whether this shape is an enum list
@@ -545,4 +788,63 @@ func (s *Shape) removeRef(ref *ShapeRef) {
 			break
 		}
 	}
+}
+
+func (s *Shape) WillRefBeBase64Encoded(refName string) bool {
+	payloadRefName := s.Payload
+	if payloadRefName == refName {
+		return false
+	}
+
+	ref, ok := s.MemberRefs[refName]
+	if !ok {
+		panic(fmt.Sprintf("shape %s does not contain %q refName", s.ShapeName, refName))
+	}
+
+	return ref.Shape.Type == "blob"
+}
+
+// Clone returns a cloned version of the shape with all references clones.
+//
+// Does not clone EventStream or Validate related values.
+func (s *Shape) Clone(newName string) *Shape {
+	if s.AliasedShapeName {
+		panic(fmt.Sprintf("attempted to clone and rename %s, but flagged as aliased",
+			s.ShapeName))
+	}
+
+	n := new(Shape)
+	*n = *s
+
+	debugLogger.Logln("cloning", s.ShapeName, "to", newName)
+
+	n.MemberRefs = map[string]*ShapeRef{}
+	for k, r := range s.MemberRefs {
+		nr := new(ShapeRef)
+		*nr = *r
+		nr.Shape.refs = append(nr.Shape.refs, nr)
+		n.MemberRefs[k] = nr
+	}
+
+	if n.MemberRef.Shape != nil {
+		n.MemberRef.Shape.refs = append(n.MemberRef.Shape.refs, &n.MemberRef)
+	}
+	if n.KeyRef.Shape != nil {
+		n.KeyRef.Shape.refs = append(n.KeyRef.Shape.refs, &n.KeyRef)
+	}
+	if n.ValueRef.Shape != nil {
+		n.ValueRef.Shape.refs = append(n.ValueRef.Shape.refs, &n.ValueRef)
+	}
+
+	n.refs = []*ShapeRef{}
+
+	n.Required = append([]string{}, n.Required...)
+	n.Enum = append([]string{}, n.Enum...)
+	n.EnumConsts = append([]string{}, n.EnumConsts...)
+
+	n.OrigShapeName = n.ShapeName
+	n.API.Shapes[newName] = n
+	n.ShapeName = newName
+
+	return n
 }
